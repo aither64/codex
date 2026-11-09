@@ -74,6 +74,11 @@ struct AppServerArgs {
     #[arg(long = "remote-control", hide = true)]
     remote_control: bool,
 
+    /// Allow the host to resume and send input on other configured providers.
+    /// Managed provider requirements still apply. Fixed for this server process.
+    #[arg(long, default_value_t = false)]
+    allow_host_provider_switching: bool,
+
     /// Save loaded threads during managed daemon shutdown.
     #[arg(long, hide = true)]
     managed_daemon: bool,
@@ -94,6 +99,7 @@ fn main() -> anyhow::Result<()> {
             disable_plugin_startup_tasks_for_tests,
             remote_control,
             managed_daemon,
+            allow_host_provider_switching,
         } = AppServerArgs::parse();
         let loader_overrides = if disable_managed_config_from_debug_env() {
             LoaderOverrides::without_managed_config_for_tests()
@@ -108,6 +114,7 @@ fn main() -> anyhow::Result<()> {
             cloud_skills_snapshot,
             code_mode_host_transport: code_mode_host.into(),
             managed_daemon,
+            allow_host_provider_switching,
             ..Default::default()
         };
         #[cfg(debug_assertions)]

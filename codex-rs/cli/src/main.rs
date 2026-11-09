@@ -604,6 +604,11 @@ struct AppServerCommand {
     #[arg(long = "remote-control", hide = true)]
     remote_control: bool,
 
+    /// Allow the host to resume and send input on other configured providers.
+    /// Managed provider requirements still apply. Fixed for this server process.
+    #[arg(long, default_value_t = false)]
+    allow_host_provider_switching: bool,
+
     /// Save loaded threads during managed daemon shutdown.
     #[arg(long, hide = true)]
     managed_daemon: bool,
@@ -1244,6 +1249,7 @@ async fn dispatch_cli(
                 stdio,
                 remote_control,
                 managed_daemon,
+                allow_host_provider_switching,
                 analytics_default_enabled,
                 auth,
             } = app_server_cli;
@@ -1289,6 +1295,7 @@ async fn dispatch_cli(
                         cloud_skills_snapshot,
                         code_mode_host_transport: code_mode_host.into(),
                         managed_daemon,
+                        allow_host_provider_switching,
                         remote_control_startup_mode: match (remote_control, remote_control_disabled)
                         {
                             (true, _) => {
@@ -3399,6 +3406,24 @@ enabled = true
             unreachable!()
         };
         app_server
+    }
+
+    #[test]
+    fn app_server_host_provider_switching_requires_startup_flag() {
+        assert!(!app_server_from_args(&["codex", "app-server"]).allow_host_provider_switching);
+        assert!(
+            app_server_from_args(&["codex", "app-server", "--allow-host-provider-switching"])
+                .allow_host_provider_switching
+        );
+        assert!(
+            !app_server_from_args(&[
+                "codex",
+                "app-server",
+                "-c",
+                "allow_host_provider_switching=true"
+            ])
+            .allow_host_provider_switching
+        );
     }
 
     fn default_app_server_socket_path() -> AbsolutePathBuf {

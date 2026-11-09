@@ -40,12 +40,16 @@ use tokio::sync::oneshot;
 use tokio::time::timeout;
 use wiremock::MockServer;
 
-#[test_case("other"; "selection_changes")]
-#[test_case("gateway"; "definition_changes")]
-#[test_case("default"; "default_selection_changes")]
+#[test_case("other", false; "selection_changes")]
+#[test_case("gateway", false; "definition_changes")]
+#[test_case("default", false; "default_selection_changes")]
+#[test_case("other", true; "host_selection_changes")]
+#[test_case("gateway", true; "host_definition_changes")]
+#[test_case("missing", true; "host_missing_definition")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn provider_requirement_changes_reject_inputs_to_existing_threads(
     required_selection: &str,
+    allow_host_provider_switching: bool,
 ) -> Result<()> {
     let (release_response, response_gate) = oneshot::channel();
     let (gateway, _) = start_streaming_sse_server(vec![vec![
@@ -79,7 +83,7 @@ base_url = "{}/v1"
         other.uri(),
     );
     let requirements_path = home.path().join("requirements.toml");
-    if required_selection == "default" {
+    if matches!(required_selection, "default" | "missing") {
         std::fs::write(
             &requirements_path,
             requirements.replace("model_provider = \"gateway\"", ""),
@@ -93,6 +97,11 @@ base_url = "{}/v1"
     let mut server = TestAppServer::builder()
         .with_codex_home(home.path())
         .with_json_logging("warn")
+        .with_args(if allow_host_provider_switching {
+            &["--allow-host-provider-switching"]
+        } else {
+            &[]
+        })
         .build_initialized()
         .await?;
     let started = server.start_thread(ThreadStartParams::default()).await?;
@@ -136,19 +145,28 @@ base_url = "{}/v1"
     } else {
         requirements.replace(gateway.uri(), &other.uri())
     };
-    let provider_error = if required_selection == "default" {
+    let provider_error = if matches!(required_selection, "default" | "missing") {
         let path = home.path().join("config.toml");
         let config = std::fs::read_to_string(&path)?;
-        std::fs::write(
-            path,
-            config.replace("model_provider = \"gateway\"", "model_provider = \"other\""),
-        )?;
-        codex_app_server_protocol::ModelProviderError::ModelProviderMismatch {
-            model_provider: "gateway".into(),
-            current_model_provider: "other".into(),
+        if required_selection == "missing" {
+            // Managed defaults keep the builtin selected, but the retained route is removed.
+            std::fs::write(home.path().join("requirements.toml"), "")?;
+            std::fs::write(path, "model_provider = 'openai'")?;
+            codex_app_server_protocol::ModelProviderError::ModelProviderNotConfigured {
+                model_provider: "gateway".into(),
+            }
+        } else {
+            std::fs::write(
+                path,
+                config.replace("model_provider = \"gateway\"", "model_provider = \"other\""),
+            )?;
+            codex_app_server_protocol::ModelProviderError::ModelProviderMismatch {
+                model_provider: "gateway".into(),
+                current_model_provider: "other".into(),
+            }
         }
     } else {
-        std::fs::write(requirements_path, updated)?;
+        std::fs::write(&requirements_path, updated)?;
         codex_app_server_protocol::ModelProviderError::ModelProviderPolicyConflict {
             model_provider: "gateway".into(),
             required_model_provider: required_selection.into(),
@@ -271,6 +289,20 @@ base_url = "{}/v1"
             .read_stream_until_error_message(RequestId::Integer(id))
             .await?;
         assert_eq!(error.error, expected_error);
+    }
+    if required_selection == "missing" {
+        // Restoring the effective definition makes the same loaded thread usable again.
+        std::fs::write(&requirements_path, &requirements)?;
+        let id = server
+            .send_raw_request(
+                "thread/resume",
+                Some(json!({"threadId": started.thread.id})),
+            )
+            .await?;
+        let resumed: codex_app_server_protocol::ThreadResumeResponse =
+            server.read_response(id).await?;
+        assert_eq!(resumed.thread.id, started.thread.id);
+        assert_eq!(resumed.model_provider, "gateway");
     }
     assert_eq!(gateway.requests().await.len(), 1);
     let other_requests = other.received_requests().await.expect("recorded requests");
@@ -425,5 +457,242 @@ async fn malformed_system_defaults_reject_input_until_provider_can_be_resolved()
     assert_eq!(response.code, -32600);
     assert!(requests.requests().is_empty());
     client.shutdown().await?;
+    Ok(())
+}
+
+#[test_case(false; "default_refuses")]
+#[test_case(true; "host_opt_in")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_provider_switching_preserves_routes_and_thread_identity(allow: bool) -> Result<()> {
+    let primary =
+        app_test_support::create_mock_responses_server_repeating_assistant("Primary").await;
+    let alternate =
+        app_test_support::create_mock_responses_server_repeating_assistant("Alternate").await;
+    let home = TempDir::new()?;
+    MockResponsesConfig::new(&primary.uri())
+        .with_extra_config(&format!(
+            "[model_providers.alternate]\nname = 'Alternate'\nbase_url = '{}/v1'\nwire_api = 'responses'\nrequest_max_retries = 0\nstream_max_retries = 0",
+            alternate.uri(),
+        ))
+        .write(home.path())?;
+    let mut server = TestAppServer::builder()
+        .with_codex_home(home.path())
+        .with_args(if allow {
+            &["--allow-host-provider-switching"]
+        } else {
+            &[]
+        })
+        // Neither request config nor a similarly named environment variable grants authority.
+        .with_env_overrides(&[("CODEX_ALLOW_HOST_PROVIDER_SWITCHING", Some("1"))])
+        .build_initialized()
+        .await?;
+    let first = server.start_thread(ThreadStartParams::default()).await?;
+    let second = server
+        .start_thread(ThreadStartParams {
+            model_provider: Some("alternate".into()),
+            config: Some(std::collections::HashMap::from([(
+                "allow_host_provider_switching".into(),
+                json!(true),
+            )])),
+            ..Default::default()
+        })
+        .await?;
+    let input = vec![UserInput::Text {
+        text: "Continue.".into(),
+        text_elements: Vec::new(),
+    }];
+    let id = server
+        .send_turn_start_request(TurnStartParams {
+            thread_id: second.thread.id.clone(),
+            input: input.clone(),
+            ..Default::default()
+        })
+        .await?;
+    if !allow {
+        let error = server
+            .read_stream_until_error_message(RequestId::Integer(id))
+            .await?;
+        let expected = codex_app_server_protocol::ModelProviderError::ModelProviderMismatch {
+            model_provider: "alternate".into(),
+            current_model_provider: "mock_provider".into(),
+        };
+        assert_eq!(
+            error.error,
+            JSONRPCErrorError {
+                code: -32600,
+                message: expected.to_string(),
+                data: Some(serde_json::to_value(expected)?),
+            }
+        );
+        assert!(
+            alternate
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .is_empty()
+        );
+    } else {
+        let _: TurnStartResponse = server.read_response(id).await?;
+        server
+            .read_stream_until_notification_message("turn/completed")
+            .await?;
+    }
+    // Materialize an ordinary history through inference before testing cold resume.
+    let id = server
+        .send_turn_start_request(TurnStartParams {
+            thread_id: first.thread.id.clone(),
+            input: input.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let _: TurnStartResponse = server.read_response(id).await?;
+    server
+        .read_stream_until_notification_message("turn/completed")
+        .await?;
+    for target in ["alternate", "mock_provider"] {
+        let id = server
+            .send_raw_request("thread/archive", Some(json!({"threadId": first.thread.id})))
+            .await?;
+        let _: codex_app_server_protocol::ThreadArchiveResponse = server.read_response(id).await?;
+        let id = server
+            .send_raw_request(
+                "thread/unarchive",
+                Some(json!({"threadId": first.thread.id})),
+            )
+            .await?;
+        let _: codex_app_server_protocol::ThreadUnarchiveResponse =
+            server.read_response(id).await?;
+        let id = server
+            .send_thread_resume_request(codex_app_server_protocol::ThreadResumeParams {
+                thread_id: first.thread.id.clone(),
+                model_provider: Some(target.into()),
+                config: Some(std::collections::HashMap::from([(
+                    "allow_host_provider_switching".into(),
+                    json!(true),
+                )])),
+                ..Default::default()
+            })
+            .await?;
+        if !allow {
+            let error = server
+                .read_stream_until_error_message(RequestId::Integer(id))
+                .await?;
+            let expected = codex_app_server_protocol::ModelProviderError::ModelProviderMismatch {
+                model_provider: "alternate".into(),
+                current_model_provider: "mock_provider".into(),
+            };
+            assert_eq!(
+                error.error,
+                JSONRPCErrorError {
+                    code: -32600,
+                    message: expected.to_string(),
+                    data: Some(serde_json::to_value(expected)?),
+                }
+            );
+            assert!(
+                alternate
+                    .received_requests()
+                    .await
+                    .expect("recorded requests")
+                    .is_empty()
+            );
+            break;
+        }
+        let resumed: codex_app_server_protocol::ThreadResumeResponse =
+            server.read_response(id).await?;
+        assert_eq!(resumed.thread.id, first.thread.id);
+        assert_eq!(resumed.model_provider, target);
+        assert!(
+            !resumed.thread.turns.is_empty(),
+            "materialized history survives switching"
+        );
+        let id = server
+            .send_turn_start_request(TurnStartParams {
+                thread_id: first.thread.id.clone(),
+                input: input.clone(),
+                ..Default::default()
+            })
+            .await?;
+        let _: TurnStartResponse = server.read_response(id).await?;
+        server
+            .read_stream_until_notification_message("turn/completed")
+            .await?;
+    }
+    if allow {
+        // The other loaded thread retains its own route after both switches.
+        let id = server
+            .send_turn_start_request(TurnStartParams {
+                thread_id: second.thread.id.clone(),
+                input,
+                ..Default::default()
+            })
+            .await?;
+        let _: TurnStartResponse = server.read_response(id).await?;
+        server
+            .read_stream_until_notification_message("turn/completed")
+            .await?;
+    }
+    for (endpoint, expected) in [
+        (&primary, if allow { 2 } else { 1 }),
+        (&alternate, if allow { 3 } else { 0 }),
+    ] {
+        let requests = endpoint
+            .received_requests()
+            .await
+            .expect("recorded requests");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.url.path().ends_with("/responses"))
+                .count(),
+            expected
+        );
+    }
+    server.shutdown_gracefully().await?;
+    Ok(())
+}
+
+#[test_case(false; "default")]
+#[test_case(true; "host_opt_in")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_current_config_rejects_host_provider_input_before_inference(
+    allow: bool,
+) -> Result<()> {
+    let provider = MockServer::start().await;
+    let home = TempDir::new()?;
+    MockResponsesConfig::new(&provider.uri()).write(home.path())?;
+    let mut server = TestAppServer::builder()
+        .with_codex_home(home.path())
+        .with_args(if allow {
+            &["--allow-host-provider-switching"]
+        } else {
+            &[]
+        })
+        .build_initialized()
+        .await?;
+    let started = server.start_thread(ThreadStartParams::default()).await?;
+    std::fs::write(home.path().join("config.toml"), "invalid toml !!!")?;
+    let id = server
+        .send_turn_start_request(TurnStartParams {
+            thread_id: started.thread.id,
+            input: vec![UserInput::Text {
+                text: "Blocked.".into(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let error = server
+        .read_stream_until_error_message(RequestId::Integer(id))
+        .await?;
+    assert_eq!(error.error.code, -32600);
+    assert!(
+        provider
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .is_empty()
+    );
+    server.shutdown_gracefully().await?;
     Ok(())
 }

@@ -83,3 +83,27 @@ fn app_server_rejects_invalid_code_mode_host() {
         assert!(!rendered_error.contains("secret"));
     }
 }
+
+#[test]
+fn host_provider_switching_requires_startup_flag() {
+    assert!(
+        !AppServerArgs::try_parse_from(["codex-app-server"])
+            .expect("parse default args")
+            .allow_host_provider_switching
+    );
+    assert!(
+        AppServerArgs::try_parse_from(["codex-app-server", "--allow-host-provider-switching"])
+            .expect("parse host opt-in")
+            .allow_host_provider_switching
+    );
+    assert!(
+        !AppServerArgs::try_parse_from([
+            "codex-app-server",
+            "-c",
+            "allow_host_provider_switching=true"
+        ])
+        .expect("parse config override")
+        .allow_host_provider_switching
+    );
+    assert!(!codex_app_server::AppServerRuntimeOptions::default().allow_host_provider_switching);
+}

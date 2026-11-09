@@ -490,6 +490,8 @@ pub struct AppServerRuntimeOptions {
     pub remote_control_startup_mode: RemoteControlStartupMode,
     pub install_shutdown_signal_handler: bool,
     pub managed_daemon: bool,
+    /// Permit host-selected configured providers while retaining managed policy checks.
+    pub allow_host_provider_switching: bool,
 }
 
 impl Default for AppServerRuntimeOptions {
@@ -501,6 +503,7 @@ impl Default for AppServerRuntimeOptions {
             remote_control_startup_mode: RemoteControlStartupMode::ResolvePersisted,
             install_shutdown_signal_handler: true,
             managed_daemon: false,
+            allow_host_provider_switching: false,
         }
     }
 }
@@ -568,7 +571,8 @@ pub async fn run_main_with_transport_options(
         Default::default(),
         arg0_paths.clone(),
         Arc::new(NoopThreadConfigLoader),
-    );
+    )
+    .with_host_provider_switching(runtime_options.allow_host_provider_switching);
     let startup = config_manager
         .load_managed_startup_config(startup_cwd.clone())
         .await?;

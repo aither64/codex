@@ -47,6 +47,7 @@ pub(crate) struct ConfigManager {
     runtime_feature_enablement: Arc<RwLock<BTreeMap<String, bool>>>,
     loader_overrides: LoaderOverrides,
     strict_config: bool,
+    allow_host_provider_switching: bool,
     cloud_config_bundle: Arc<RwLock<CloudConfigBundleLoader>>,
     arg0_paths: Arg0DispatchPaths,
     thread_config_loader: Arc<dyn ThreadConfigLoader>,
@@ -106,6 +107,7 @@ impl ConfigManager {
             runtime_feature_enablement: Arc::new(RwLock::new(BTreeMap::new())),
             loader_overrides,
             strict_config,
+            allow_host_provider_switching: false,
             cloud_config_bundle: Arc::new(RwLock::new(cloud_config_bundle)),
             arg0_paths,
             thread_config_loader,
@@ -115,6 +117,12 @@ impl ConfigManager {
             network_policy_snapshot: Arc::default(),
             mcp_ema_cancellation: Arc::default(),
         }
+    }
+
+    /// Host authority is fixed at startup and cannot be enabled by request config.
+    pub(crate) fn with_host_provider_switching(mut self, allow: bool) -> Self {
+        self.allow_host_provider_switching = allow;
+        self
     }
 
     pub(crate) fn codex_home(&self) -> &Path {
@@ -430,7 +438,7 @@ impl ConfigManager {
         Ok(CloudStartupConfig { bootstrap, config })
     }
 
-    /// Admits resumed threads and input only on the currently selected provider.
+    /// Enforces provider policy and, by default, the currently selected provider.
     pub(crate) async fn check_thread_model_provider_for_input(
         &self,
         current: &Config,
@@ -439,7 +447,22 @@ impl ConfigManager {
         let configured = self
             .load_latest_config(Some(current.cwd.to_path_buf()))
             .await?;
-        if current.model_provider_id != configured.model_provider_id {
+        // Equality normally implies membership in the effective configured provider map.
+        if self.allow_host_provider_switching
+            && !configured
+                .model_providers
+                .contains_key(&current.model_provider_id)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                ModelProviderError::ModelProviderNotConfigured {
+                    model_provider: current.model_provider_id.clone(),
+                },
+            ));
+        }
+        if !self.allow_host_provider_switching
+            && current.model_provider_id != configured.model_provider_id
+        {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 ModelProviderError::ModelProviderMismatch {
@@ -598,7 +621,7 @@ impl ConfigManager {
                     saved_provider.unwrap_or(requested_provider),
                     requested_provider,
                 ] {
-                    if provider != current_provider {
+                    if !self.allow_host_provider_switching && provider != current_provider {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
                             ModelProviderError::ModelProviderMismatch {

@@ -320,3 +320,146 @@ name = "Gateway"
     );
     Ok(())
 }
+
+#[test_case(false; "default")]
+#[test_case(true; "host_opt_in")]
+#[tokio::test]
+async fn host_provider_switching_only_relaxes_selection_equality(allow: bool) -> Result<()> {
+    let home = tempdir()?;
+    std::fs::write(
+        home.path().join("config.toml"),
+        "[model_providers.gateway]\nname = 'Gateway'",
+    )?;
+    let manager = ConfigManager::without_managed_config_for_tests(home.path().to_path_buf())
+        .with_host_provider_switching(allow);
+    let resume = |saved: &'static str, requested: &'static str| {
+        manager.load_for_resume(
+            Some(saved),
+            None,
+            ConfigOverrides {
+                model_provider: Some(requested.into()),
+                ..Default::default()
+            },
+            Some(home.path().to_path_buf()),
+        )
+    };
+    let result = resume("openai", "gateway").await;
+    if allow {
+        let current = result?;
+        assert_eq!(current.model_provider_id, "gateway");
+        manager
+            .check_thread_model_provider_for_input(&current)
+            .await?;
+        let builtin = resume("openai", "openai").await?;
+        manager
+            .check_thread_model_provider_for_input(&builtin)
+            .await?;
+        // Local definition edits must neither reject nor reroute the loaded snapshot.
+        let retained = current.model_provider.clone();
+        std::fs::write(
+            home.path().join("config.toml"),
+            "[model_providers.gateway]\nname = 'Changed'\nbase_url = 'https://changed.example.test'",
+        )?;
+        manager
+            .check_thread_model_provider_for_input(&current)
+            .await?;
+        assert_eq!(current.model_provider, retained);
+        std::fs::write(home.path().join("config.toml"), "model_provider = 'openai'")?;
+        let error = manager
+            .check_thread_model_provider_for_input(&current)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<ModelProviderError>()),
+            Some(&ModelProviderError::ModelProviderNotConfigured {
+                model_provider: "gateway".into()
+            })
+        );
+        *manager.cloud_config_bundle.write().unwrap() =
+            CloudConfigBundleFixture::loader_with_enterprise_requirement(
+                "model_provider = 'other'",
+            );
+        assert_eq!(
+            manager
+                .check_thread_model_provider_for_input(&current)
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        *manager.cloud_config_bundle.write().unwrap() = CloudConfigBundleLoader::default();
+        std::fs::write(
+            home.path().join("config.toml"),
+            "[model_providers.gateway]\nname = 'Gateway'",
+        )?;
+        manager
+            .check_thread_model_provider_for_input(&current)
+            .await?;
+        // The flag does not skip loading the current configuration on input or resume.
+        std::fs::write(home.path().join("config.toml"), "invalid toml !!!")?;
+        assert!(
+            manager
+                .check_thread_model_provider_for_input(&current)
+                .await
+                .is_err()
+        );
+        assert!(resume("openai", "openai").await.is_err());
+    } else {
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+    }
+    std::fs::write(
+        home.path().join("config.toml"),
+        "[model_providers.gateway]\nname = 'Gateway'",
+    )?;
+    for (saved, requested) in [("missing", "gateway"), ("openai", "missing")] {
+        assert_eq!(
+            resume(saved, requested).await.unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+    Ok(())
+}
+
+#[test_case(false; "default")]
+#[test_case(true; "host_opt_in")]
+#[tokio::test]
+async fn request_config_cannot_enable_host_provider_switching(allow: bool) -> Result<()> {
+    let home = tempdir()?;
+    std::fs::write(
+        home.path().join("config.toml"),
+        "[model_providers.gateway]\nname = 'Gateway'",
+    )?;
+    let manager = ConfigManager::without_managed_config_for_tests(home.path().to_path_buf())
+        .with_host_provider_switching(allow);
+    let result = manager
+        .load_for_resume(
+            Some("gateway"),
+            Some(HashMap::from([(
+                "allow_host_provider_switching".into(),
+                serde_json::json!(true),
+            )])),
+            ConfigOverrides {
+                model_provider: Some("gateway".into()),
+                ..Default::default()
+            },
+            Some(home.path().to_path_buf()),
+        )
+        .await;
+    if allow {
+        assert_eq!(result?.model_provider_id, "gateway");
+    } else {
+        let error = result.unwrap_err();
+        assert_eq!(
+            error
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<ModelProviderError>()),
+            Some(&ModelProviderError::ModelProviderMismatch {
+                model_provider: "gateway".into(),
+                current_model_provider: "openai".into(),
+            })
+        );
+    }
+    Ok(())
+}

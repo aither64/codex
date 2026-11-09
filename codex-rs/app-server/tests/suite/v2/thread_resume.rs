@@ -6812,14 +6812,19 @@ async fn setup_rollout_fixture(codex_home: &Path, server_uri: &str) -> Result<Ro
     })
 }
 
-#[test_case::test_case(false, false; "missing_definition_config_override")]
-#[test_case::test_case(false, true; "missing_definition_typed_override")]
-#[test_case::test_case(true, false; "policy_conflict_config_override")]
-#[test_case::test_case(true, true; "policy_conflict_typed_override")]
+#[test_case::test_case(false, false, false; "missing_definition_config_override")]
+#[test_case::test_case(false, true, false; "missing_definition_typed_override")]
+#[test_case::test_case(true, false, false; "policy_conflict_config_override")]
+#[test_case::test_case(true, true, false; "policy_conflict_typed_override")]
+#[test_case::test_case(false, false, true; "host_missing_definition_config_override")]
+#[test_case::test_case(false, true, true; "host_missing_definition_typed_override")]
+#[test_case::test_case(true, false, true; "host_policy_conflict_config_override")]
+#[test_case::test_case(true, true, true; "host_policy_conflict_typed_override")]
 #[tokio::test]
 async fn thread_resume_returns_provider_error_even_with_provider_override(
     policy_conflict: bool,
     typed_override: bool,
+    allow_host_provider_switching: bool,
 ) -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let home = TempDir::new()?;
@@ -6849,6 +6854,11 @@ async fn thread_resume_returns_provider_error_even_with_provider_override(
     }
     let mut client = TestAppServer::builder()
         .with_codex_home(home.path())
+        .with_args(if allow_host_provider_switching {
+            &["--allow-host-provider-switching"]
+        } else {
+            &[]
+        })
         .build_initialized()
         .await?;
     let expected = if policy_conflict {
@@ -6864,6 +6874,13 @@ async fn thread_resume_returns_provider_error_even_with_provider_override(
     // Model and reasoning overrides must not discard the provider being validated.
     for mut params in [
         ThreadResumeParams::default(),
+        ThreadResumeParams {
+            config: Some(std::collections::HashMap::from([(
+                "allow_host_provider_switching".into(),
+                json!(true),
+            )])),
+            ..Default::default()
+        },
         ThreadResumeParams {
             model: Some("gpt-5.1-codex".into()),
             ..Default::default()
