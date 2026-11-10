@@ -1521,6 +1521,173 @@ async fn thread_resume_preserves_goal_first_and_fork_approvals_reviewer() -> Res
     Ok(())
 }
 
+#[test_case::test_case(false; "subscribed")]
+#[test_case::test_case(true; "unsubscribed_server_restart")]
+#[tokio::test]
+async fn thread_resume_same_provider_preserves_durable_model_and_effort(
+    unsubscribe: bool,
+) -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Saved response").await;
+    let home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri())
+        .with_model_provider("alternate")
+        .with_model("gpt-5.5")
+        .with_root_config("model_reasoning_effort = 'xhigh'")
+        .write(home.path())?;
+    let original_config = std::fs::read(home.path().join("config.toml"))?;
+    let mut client = TestAppServer::builder()
+        .with_codex_home(home.path())
+        .build_initialized()
+        .await?;
+    // Keep the public cwd and execution environment on one stable root. The
+    // automatic start helper otherwise selects its separate temporary workspace.
+    let workspace = normalized_existing_path(home.path())?.abs();
+    let start_id = client
+        .send_thread_start_request(ThreadStartParams {
+            cwd: Some(workspace.to_string_lossy().into_owned()),
+            runtime_workspace_roots: Some(vec![workspace.clone()]),
+            environments: Some(vec![TurnEnvironmentParams {
+                environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
+                cwd: workspace.clone().into(),
+                runtime_workspace_roots: Some(vec![workspace.clone().into()]),
+            }]),
+            model: Some("gpt-5.5".into()),
+            model_provider: Some("alternate".into()),
+            history_mode: Some(ThreadHistoryMode::Legacy),
+            config: Some(std::collections::HashMap::from([(
+                "model_reasoning_effort".into(),
+                json!("high"),
+            )])),
+            ..Default::default()
+        })
+        .await?;
+    let started: ThreadStartResponse =
+        timeout(DEFAULT_READ_TIMEOUT, client.read_response(start_id)).await??;
+    assert_eq!(started.cwd, workspace);
+    assert_eq!(started.runtime_workspace_roots, vec![workspace]);
+    assert_eq!(started.reasoning_effort, Some(ReasoningEffort::High));
+    client
+        .start_turn_and_wait_for_completion(TurnStartParams {
+            thread_id: started.thread.id.clone(),
+            input: vec![UserInput::Text {
+                text: "Persist this high-effort thread.".into(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let id = client
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: started.thread.id.clone(),
+            include_turns: true,
+        })
+        .await?;
+    let before: ThreadReadResponse = client.read_response(id).await?;
+    assert_eq!(before.thread.reasoning_effort, Some(ReasoningEffort::High));
+    assert_eq!(before.thread.turns.len(), 1);
+    assert_eq!(before.thread.turns[0].status, TurnStatus::Completed);
+
+    // This is a required durable precondition, never a metadata injection or repair.
+    let state = StateRuntime::init(
+        codex_state::SqliteConfig::new_for_testing(home.path().abs()),
+        "alternate".into(),
+    )
+    .await?;
+    let metadata = state
+        .get_thread(ThreadId::from_string(&started.thread.id)?)
+        .await?
+        .expect("completed public start must persist thread metadata before resume");
+    assert_eq!(
+        metadata.model.as_deref(),
+        Some("gpt-5.5"),
+        "durable model precondition"
+    );
+    assert_eq!(
+        metadata.model_provider, "alternate",
+        "durable provider precondition"
+    );
+    assert_eq!(
+        metadata.reasoning_effort,
+        Some(ReasoningEffort::High),
+        "durable HIGH precondition; stop here if persistence is not established"
+    );
+    drop(state);
+
+    if unsubscribe {
+        let id = client
+            .send_thread_unsubscribe_request(ThreadUnsubscribeParams {
+                thread_id: started.thread.id.clone(),
+            })
+            .await?;
+        let response: serde_json::Value = client.read_response(id).await?;
+        assert_eq!(response["status"], "unsubscribed");
+        // TestAppServer owns the stdio server: this control proves cold restoration,
+        // not the separate same-daemon subscriber-lifetime acceptance boundary.
+        assert!(client.shutdown_gracefully().await?.success());
+        client = TestAppServer::builder()
+            .with_codex_home(home.path())
+            .build_initialized()
+            .await?;
+    }
+    let params = ThreadResumeParams {
+        thread_id: started.thread.id.clone(),
+        model_provider: Some("alternate".into()),
+        config: Some(std::collections::HashMap::from([(
+            "suppress_unstable_features_warning".into(),
+            json!(true),
+        )])),
+        ..Default::default()
+    };
+    let wire = serde_json::to_value(&params)?;
+    assert!(wire["model"].is_null());
+    assert_eq!(wire["modelProvider"], "alternate");
+    assert!(wire["config"].get("model_reasoning_effort").is_none());
+    let id = client.send_thread_resume_request(params).await?;
+    let resumed: ThreadResumeResponse = client.read_response(id).await?;
+    assert_eq!(resumed.thread.id, started.thread.id);
+    assert_eq!(resumed.model, "gpt-5.5");
+    assert_eq!(resumed.model_provider, "alternate");
+    assert_eq!(resumed.reasoning_effort, Some(ReasoningEffort::High));
+    assert_eq!(resumed.approval_policy, started.approval_policy);
+    assert_eq!(resumed.approvals_reviewer, started.approvals_reviewer);
+    assert_eq!(resumed.sandbox, started.sandbox);
+    assert_eq!(
+        resumed.active_permission_profile,
+        started.active_permission_profile
+    );
+    assert_eq!(resumed.cwd, started.cwd);
+    assert_eq!(
+        resumed.runtime_workspace_roots,
+        started.runtime_workspace_roots
+    );
+    let id = client
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: started.thread.id.clone(),
+            include_turns: true,
+        })
+        .await?;
+    let after: ThreadReadResponse = client.read_response(id).await?;
+    assert_eq!(after.thread.id, before.thread.id);
+    assert_eq!(after.thread.reasoning_effort, Some(ReasoningEffort::High));
+    assert_eq!(after.thread.turns, before.thread.turns);
+    assert_eq!(
+        std::fs::read(home.path().join("config.toml"))?,
+        original_config
+    );
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .iter()
+            .filter(|request| request.url.path().ends_with("/responses"))
+            .count(),
+        1
+    );
+    assert!(client.shutdown_gracefully().await?.success());
+    Ok(())
+}
+
 #[tokio::test]
 async fn thread_resume_preserves_acknowledged_model_effort_and_approvals_reviewer_update()
 -> Result<()> {

@@ -980,6 +980,123 @@ mod thread_processor_behavior_tests {
         Ok(())
     }
 
+    #[test]
+    fn merge_persisted_resume_metadata_same_provider_restores_saved_settings() -> Result<()> {
+        for raw_provider in [false, true] {
+            for saved_effort in [None, Some(ReasoningEffort::High)] {
+                let mut request = Some(HashMap::from([(
+                    "suppress_unstable_features_warning".into(),
+                    serde_json::json!(true),
+                )]));
+                let mut typed = ConfigOverrides::default();
+                if raw_provider {
+                    request
+                        .as_mut()
+                        .unwrap()
+                        .insert("model_provider".into(), serde_json::json!("mock_provider"));
+                } else {
+                    typed.model_provider = Some("mock_provider".into());
+                }
+                let metadata = test_thread_metadata(Some("gpt-5.5"), saved_effort.clone())?;
+                let clear = merge_persisted_resume_metadata(&mut request, &mut typed, &metadata);
+                assert_eq!(typed.model.as_deref(), Some("gpt-5.5"));
+                assert_eq!(clear, saved_effort.is_none());
+                assert_eq!(
+                    request.as_ref().unwrap().get("model_reasoning_effort"),
+                    saved_effort
+                        .as_ref()
+                        .map(|effort| serde_json::json!(effort.to_string()))
+                        .as_ref()
+                );
+                assert_eq!(
+                    request
+                        .as_ref()
+                        .unwrap()
+                        .get("suppress_unstable_features_warning"),
+                    Some(&serde_json::json!(true))
+                );
+            }
+        }
+        // With no selector, the same production decision still clears saved None.
+        let metadata = test_thread_metadata(Some("gpt-5.5"), None)?;
+        assert!(merge_persisted_resume_metadata(
+            &mut None,
+            &mut ConfigOverrides::default(),
+            &metadata
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn merge_persisted_resume_metadata_same_provider_preserves_explicit_choices() -> Result<()> {
+        for (typed_provider, raw, explicit_model) in [
+            (
+                "mock_provider",
+                vec![("model", serde_json::json!("chosen-model"))],
+                None,
+            ),
+            (
+                "mock_provider",
+                vec![("model_reasoning_effort", serde_json::json!("low"))],
+                None,
+            ),
+            ("mock_provider", vec![], Some("chosen-model")),
+            ("other", vec![], None),
+            (
+                "mock_provider",
+                vec![("model_provider", serde_json::json!("other"))],
+                None,
+            ),
+            (
+                "other",
+                vec![("model_provider", serde_json::json!("mock_provider"))],
+                None,
+            ),
+            (
+                "mock_provider",
+                vec![("model_provider", serde_json::json!(42))],
+                None,
+            ),
+        ] {
+            let mut request = Some(
+                raw.into_iter()
+                    .map(|(key, value)| (key.to_owned(), value))
+                    .collect(),
+            );
+            let original = request.clone();
+            let mut typed = ConfigOverrides {
+                model_provider: Some(typed_provider.into()),
+                model: explicit_model.map(str::to_owned),
+                ..Default::default()
+            };
+            let metadata = test_thread_metadata(Some("saved-model"), None)?;
+            assert!(!merge_persisted_resume_metadata(
+                &mut request,
+                &mut typed,
+                &metadata
+            ));
+            assert_eq!(typed.model.as_deref(), explicit_model);
+            assert_eq!(request, original);
+        }
+        // Every supplied selector must match, even when typed selection wins resolution.
+        let mut request = Some(HashMap::from([(
+            "model_provider".into(),
+            serde_json::json!("mock_provider"),
+        )]));
+        let mut typed = ConfigOverrides {
+            model_provider: Some("mock_provider".into()),
+            ..Default::default()
+        };
+        let metadata = test_thread_metadata(Some("saved-model"), None)?;
+        assert!(merge_persisted_resume_metadata(
+            &mut request,
+            &mut typed,
+            &metadata
+        ));
+        assert_eq!(typed.model.as_deref(), Some("saved-model"));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn read_summary_from_rollout_returns_empty_preview_when_no_user_message() -> Result<()> {
         use codex_protocol::protocol::SessionMetaLine;

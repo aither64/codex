@@ -243,13 +243,17 @@ fn collect_resume_override_mismatches(
     mismatch_details
 }
 
+/// Returns whether the inherited saved effort is unset and must clear a config default.
 fn merge_persisted_resume_metadata(
     request_overrides: &mut Option<HashMap<String, serde_json::Value>>,
     typesafe_overrides: &mut ConfigOverrides,
     persisted_metadata: &ThreadMetadata,
-) {
-    let has_model_override =
-        has_model_resume_override(request_overrides.as_ref(), typesafe_overrides);
+) -> bool {
+    let has_model_override = has_model_resume_override(
+        request_overrides.as_ref(),
+        typesafe_overrides,
+        &persisted_metadata.model_provider,
+    );
 
     // Model and reasoning overrides do not imply a provider change.
     if typesafe_overrides.model_provider.is_none()
@@ -261,7 +265,7 @@ fn merge_persisted_resume_metadata(
     }
 
     if has_model_override {
-        return;
+        return false;
     }
 
     typesafe_overrides.model = persisted_metadata.model.clone();
@@ -272,6 +276,8 @@ fn merge_persisted_resume_metadata(
             serde_json::Value::String(reasoning_effort.to_string()),
         );
     }
+    // The caller must also clear a global default when the saved effort is unset.
+    persisted_metadata.reasoning_effort.is_none()
 }
 
 fn normalize_thread_list_cwd_filters(
@@ -298,14 +304,22 @@ fn normalize_thread_list_cwd_filters(
     Ok(Some(normalized_cwds))
 }
 
+// Every supplied provider selector must agree with authoritative saved metadata.
 fn has_model_resume_override(
     request_overrides: Option<&HashMap<String, serde_json::Value>>,
     typesafe_overrides: &ConfigOverrides,
+    saved_provider: &str,
 ) -> bool {
     typesafe_overrides.model.is_some()
-        || typesafe_overrides.model_provider.is_some()
+        || typesafe_overrides
+            .model_provider
+            .as_deref()
+            .is_some_and(|provider| provider != saved_provider)
         || request_overrides.is_some_and(|overrides| {
-            overrides.contains_key("model") || overrides.contains_key("model_provider")
+            overrides.contains_key("model")
+                || overrides
+                    .get("model_provider")
+                    .is_some_and(|provider| provider.as_str() != Some(saved_provider))
         })
         || request_overrides
             .is_some_and(|overrides| overrides.contains_key("model_reasoning_effort"))
@@ -4226,8 +4240,6 @@ impl ThreadRequestProcessor {
             })?;
             typesafe_overrides.approval_policy = Some(approval_policy);
         }
-        let has_explicit_model_resume_override =
-            has_model_resume_override(request_overrides.as_ref(), &typesafe_overrides);
         let persisted_model_settings = latest_persisted_model_settings(&thread_history);
         let has_override = |key| {
             request_overrides
@@ -4245,19 +4257,18 @@ impl ThreadRequestProcessor {
             }
             InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_) => None,
         };
-        let persisted_metadata = self
+        let (persisted_metadata, clear_reasoning_effort) = match self
             .load_and_apply_persisted_resume_metadata(
                 &thread_history,
                 persisted_settings.as_ref(),
                 &mut request_overrides,
                 &mut typesafe_overrides,
             )
-            .await;
-
-        let clear_reasoning_effort = !has_explicit_model_resume_override
-            && persisted_metadata
-                .as_ref()
-                .is_some_and(|metadata| metadata.reasoning_effort.is_none());
+            .await
+        {
+            Some((metadata, clear_reasoning_effort)) => (Some(metadata), clear_reasoning_effort),
+            None => (None, false),
+        };
         let config_state = ResumeConfigState {
             history_cwd: history_cwd.clone(),
             workspace_roots: typesafe_overrides.workspace_roots.clone(),
@@ -4596,7 +4607,7 @@ impl ThreadRequestProcessor {
         persisted_settings: Option<&PersistedResumeSettings>,
         request_overrides: &mut Option<HashMap<String, serde_json::Value>>,
         typesafe_overrides: &mut ConfigOverrides,
-    ) -> Option<ThreadMetadata> {
+    ) -> Option<(ThreadMetadata, bool)> {
         let InitialHistory::Resumed(resumed_history) = thread_history else {
             return None;
         };
@@ -4623,8 +4634,12 @@ impl ThreadRequestProcessor {
             .await
             .ok()
             .flatten()?;
-        merge_persisted_resume_metadata(request_overrides, typesafe_overrides, &persisted_metadata);
-        Some(persisted_metadata)
+        let clear_reasoning_effort = merge_persisted_resume_metadata(
+            request_overrides,
+            typesafe_overrides,
+            &persisted_metadata,
+        );
+        Some((persisted_metadata, clear_reasoning_effort))
     }
 
     #[expect(

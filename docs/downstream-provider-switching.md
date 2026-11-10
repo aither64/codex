@@ -37,6 +37,12 @@ existing override semantics. Embedded TUI and cloud settings ownership are
 unchanged. This request projection does not grant provider-switching authority;
 the App Server still applies its startup flag and managed requirements.
 
+When resuming a thread, reasserting its saved provider without choosing a model
+or reasoning effort retains the saved model and effort, including an unset
+effort. This inheritance requires saved thread metadata. An explicit model or
+effort choice, or selection of a different provider, keeps the existing override
+behavior. Provider admission, managed policy and permissions still apply.
+
 Without the flag, the upstream provider-mismatch errors remain unchanged. This
 exception deliberately changes the policy introduced by upstream
 [PR #57840](https://github.com/openai/codex/pull/57840), which stops execution when
@@ -62,7 +68,12 @@ library tests selected by
 `app::config_persistence::tests::resume_model_settings_preserves_only_explicit_model_overrides`
 control. List the selected tests first and require exactly six request-projection
 cases and that one selector control; an empty or different selection does not
-satisfy this check. Verify actual inference
+satisfy this check. Also run the `codex-app-server` library tests selected by
+`merge_persisted_resume_metadata_` and the public
+`thread_resume_same_provider_preserves_durable_model_and_effort` regression.
+List the selected tests first; require the complete metadata-merge group and
+both subscribed and unsubscribed public cases. The public cases must establish
+their saved HIGH metadata precondition before testing resume. Verify actual inference
 routing, same-ID switching, managed-policy refusal, malformed configuration,
 missing providers and attempts to enable the exception through request config.
 Then complete the host's native/state/child and package acceptance checks.
