@@ -273,3 +273,300 @@ async fn resume_discovers_other_providers_but_rejects_mismatched_resume() -> Res
     server.shutdown().await?;
     Ok(())
 }
+
+// The saved thread's high effort is deliberately not copied into client config:
+// omission must leave restoration to the server rather than resending global xhigh.
+fn resume_request_for_invocation(config: Config, mode: ThreadParamsMode) -> serde_json::Value {
+    let selection = crate::app::App::resume_model_settings_for_config_for_test(
+        &config,
+        &ConfigOverrides::default(),
+    );
+    let params = thread_resume_params_from_config(
+        config,
+        ThreadId::new(),
+        mode,
+        None,
+        selection,
+        crate::resume_permissions::ResumePermissions::CURRENT_CONFIG,
+    );
+    serde_json::to_value(ClientRequest::ThreadResume {
+        request_id: RequestId::Integer(7),
+        params,
+    })
+    .expect("serialize real thread/resume request")
+}
+
+async fn resume_invocation_config(
+    home: &std::path::Path,
+    overrides: &[(&str, &str)],
+) -> Result<Config> {
+    write_provider_config(home)?;
+    let path = home.join("config.toml");
+    let original = std::fs::read_to_string(&path)?;
+    std::fs::write(
+        path,
+        format!(
+            "model_reasoning_effort = 'xhigh'\n{}",
+            original.replace("gpt-5.4", "gpt-5.5"),
+        ),
+    )?;
+    Ok(ConfigBuilder::default()
+        .codex_home(home.to_path_buf())
+        .fallback_cwd(Some(home.to_path_buf()))
+        .loader_overrides(codex_config::LoaderOverrides::without_managed_config_for_tests())
+        .cli_overrides(
+            overrides
+                .iter()
+                .map(|(key, value)| (key.to_string(), toml::Value::String(value.to_string())))
+                .collect(),
+        )
+        .build()
+        .await?)
+}
+
+fn assert_remote_resume_has_no_permission_overrides(params: &serde_json::Value) {
+    for key in [
+        "approvalPolicy",
+        "approvalsReviewer",
+        "sandbox",
+        "permissions",
+        "runtimeWorkspaceRoots",
+    ] {
+        assert!(
+            params.get(key).is_none_or(serde_json::Value::is_null),
+            "{key}: {params}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn resume_invocation_remote_provider_only_omits_unchosen_model_and_effort() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let config =
+        resume_invocation_config(home.path(), &[("model_provider", "client-provider")]).await?;
+    assert_eq!(config.model.as_deref(), Some("gpt-5.5"));
+    assert_eq!(
+        config
+            .model_reasoning_effort
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("xhigh")
+    );
+    let request = resume_request_for_invocation(config, ThreadParamsMode::Remote);
+    assert_eq!(request["method"], "thread/resume");
+    let params = &request["params"];
+    assert_eq!(params["modelProvider"], "client-provider");
+    assert!(
+        params.get("model").is_none_or(serde_json::Value::is_null),
+        "unchosen model must restore from thread: {params}"
+    );
+    assert!(
+        params
+            .get("config")
+            .and_then(|config| config.get("model_reasoning_effort"))
+            .is_none(),
+        "global xhigh must not replace saved high: {params}"
+    );
+    assert_remote_resume_has_no_permission_overrides(params);
+    Ok(())
+}
+
+#[tokio::test]
+async fn resume_invocation_remote_without_model_setting_overrides_omits_defaults() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let config = resume_invocation_config(home.path(), &[]).await?;
+    let request = resume_request_for_invocation(config, ThreadParamsMode::Remote);
+    let params = &request["params"];
+    assert!(params.get("model").is_none_or(serde_json::Value::is_null));
+    assert!(
+        params
+            .get("modelProvider")
+            .is_none_or(serde_json::Value::is_null)
+    );
+    assert!(
+        params
+            .get("config")
+            .and_then(|config| config.get("model_reasoning_effort"))
+            .is_none()
+    );
+    assert_remote_resume_has_no_permission_overrides(params);
+    Ok(())
+}
+
+#[tokio::test]
+async fn resume_invocation_remote_keeps_deliberate_model_and_effort_choices() -> Result<()> {
+    for (choices, expected_model, expected_effort) in [
+        (
+            vec![
+                ("model_provider", "client-provider"),
+                ("model_reasoning_effort", "high"),
+            ],
+            "gpt-5.5",
+            "high",
+        ),
+        (
+            vec![("model_provider", "client-provider"), ("model", "gpt-5.4")],
+            "gpt-5.4",
+            "xhigh",
+        ),
+        (
+            vec![
+                ("model_provider", "client-provider"),
+                ("model", "gpt-5.4"),
+                ("model_reasoning_effort", "medium"),
+            ],
+            "gpt-5.4",
+            "medium",
+        ),
+    ] {
+        let home = tempfile::tempdir()?;
+        let config = resume_invocation_config(home.path(), &choices).await?;
+        let request = resume_request_for_invocation(config, ThreadParamsMode::Remote);
+        let params = &request["params"];
+        assert_eq!(params["modelProvider"], "client-provider");
+        assert_eq!(params["model"], expected_model);
+        assert_eq!(params["config"]["model_reasoning_effort"], expected_effort);
+        assert_remote_resume_has_no_permission_overrides(params);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn resume_invocation_selected_profile_keeps_current_model_setting_semantics() -> Result<()> {
+    for profile_choices in [
+        "model_provider = 'client-provider'",
+        "model_provider = 'client-provider'\nmodel = 'gpt-5.5'\nmodel_reasoning_effort = 'xhigh'",
+    ] {
+        let home = tempfile::tempdir()?;
+        let base = resume_invocation_config(home.path(), &[]).await?;
+        let profile_path = AbsolutePathBuf::try_from(home.path().join("selected.config.toml"))?;
+        std::fs::write(&profile_path, profile_choices)?;
+        let config = ConfigBuilder::default()
+            .codex_home(base.codex_home.to_path_buf())
+            .fallback_cwd(Some(home.path().to_path_buf()))
+            .loader_overrides(codex_config::LoaderOverrides {
+                system_config_path: Some(home.path().join("config.toml")),
+                user_config_path: Some(profile_path),
+                user_config_profile: Some("selected".parse()?),
+                ..codex_config::LoaderOverrides::without_managed_config_for_tests()
+            })
+            .build()
+            .await?;
+        let request = resume_request_for_invocation(config, ThreadParamsMode::Remote);
+        let params = &request["params"];
+        assert_eq!(params["modelProvider"], "client-provider");
+        assert_eq!(params["model"], "gpt-5.5");
+        assert_eq!(params["config"]["model_reasoning_effort"], "xhigh");
+        assert_remote_resume_has_no_permission_overrides(params);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn resume_invocation_provider_only_keeps_cloud_and_embedded_projection_unchanged()
+-> Result<()> {
+    let home = tempfile::tempdir()?;
+    let config =
+        resume_invocation_config(home.path(), &[("model_provider", "client-provider")]).await?;
+    let cloud = resume_request_for_invocation(config.clone(), ThreadParamsMode::Cloud);
+    let cloud_params: ThreadResumeParams = serde_json::from_value(cloud["params"].clone())?;
+    assert_eq!(
+        cloud_params,
+        ThreadResumeParams {
+            thread_id: cloud_params.thread_id.clone(),
+            ..Default::default()
+        }
+    );
+    let embedded = resume_request_for_invocation(config, ThreadParamsMode::Embedded);
+    assert_eq!(embedded["params"]["modelProvider"], "client-provider");
+    assert_eq!(embedded["params"]["model"], "gpt-5.5");
+    assert_eq!(
+        embedded["params"]["config"]["model_reasoning_effort"],
+        "xhigh"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn resume_invocation_provider_only_keeps_session_provider_in_rollout_request() -> Result<()> {
+    for explicit_provider in [None, Some("server-provider")] {
+        let home = tempfile::tempdir()?;
+        let config =
+            resume_invocation_config(home.path(), &[("model_provider", "client-provider")]).await?;
+        let selection = crate::app::App::resume_model_settings_for_config_for_test(
+            &config,
+            &ConfigOverrides::default(),
+        );
+        let local_settings = LocalSettings::from(&config);
+        let thread_id = ThreadId::new();
+        let (client, mut commands, _events) =
+            codex_app_server_client::CloudClient::channel(/*capacity*/ 1);
+        // Only the transport is in-memory; execute the production remote resume path.
+        let mut session = AppServerSession::new(
+            crate::backend_id::BackendId::new(),
+            AppServerClient::Cloud(client),
+            ThreadParamsMode::Remote,
+        );
+        session.model_provider_override = explicit_provider.map(str::to_owned);
+        let (result, request) = tokio::join!(
+            Box::pin(session.resume_thread_with_permission_overrides(
+                &local_settings,
+                config,
+                thread_id,
+                selection,
+                crate::resume_permissions::ResumePermissions::CURRENT_CONFIG,
+            )),
+            async {
+                let read = commands.recv().await.expect("pre-resume metadata request");
+                let codex_app_server_client::CloudOperation::Request(request) = read.operation
+                else {
+                    panic!("expected metadata request")
+                };
+                assert!(matches!(*request, ClientRequest::ThreadRead { .. }));
+                read.response
+                    .send(Ok(Err(JSONRPCErrorError {
+                        code: JSONRPC_INVALID_REQUEST,
+                        message: "metadata unavailable in request-only test".into(),
+                        data: None,
+                    })))
+                    .expect("resume awaits metadata response");
+                let resume = commands.recv().await.expect("thread/resume request");
+                let codex_app_server_client::CloudOperation::Request(request) = resume.operation
+                else {
+                    panic!("expected resume request")
+                };
+                assert!(matches!(
+                    request.as_ref(),
+                    ClientRequest::ThreadResume { .. }
+                ));
+                let wire = serde_json::to_value(request).expect("serialize actual resume request");
+                resume
+                    .response
+                    .send(Ok(Err(JSONRPCErrorError {
+                        code: JSONRPC_INVALID_REQUEST,
+                        message: "stop after recording resume request".into(),
+                        data: None,
+                    })))
+                    .expect("resume awaits recorded response");
+                wire
+            }
+        );
+        result.expect_err("request-only fixture deliberately stops at resume");
+        let params = &request["params"];
+        assert_eq!(params["threadId"], thread_id.to_string());
+        assert_eq!(
+            params["modelProvider"],
+            explicit_provider.unwrap_or("client-provider")
+        );
+        assert!(params.get("model").is_none_or(serde_json::Value::is_null));
+        assert!(
+            params
+                .get("config")
+                .and_then(|config| config.get("model_reasoning_effort"))
+                .is_none()
+        );
+        assert_remote_resume_has_no_permission_overrides(params);
+    }
+    Ok(())
+}

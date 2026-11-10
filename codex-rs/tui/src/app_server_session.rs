@@ -379,6 +379,8 @@ pub(crate) enum ThreadSettingsOwner {
 pub(crate) enum ResumeModelSettings {
     /// Sends the current config's model, provider, and reasoning effort as explicit overrides.
     OverrideFromCurrentConfig,
+    /// Remote resume overrides only the provider; embedded resume keeps its full config.
+    OverrideProviderFromCurrentConfig,
     /// Omits those overrides so app-server restores the settings saved with the thread.
     RestoreFromThread,
     /// Rejoins a loaded thread without changing any of its existing settings.
@@ -2415,6 +2417,13 @@ fn thread_resume_params_from_config(
             ..ThreadResumeParams::default()
         };
     }
+    let model_settings = if thread_params_mode == ThreadParamsMode::Embedded
+        && model_settings == ResumeModelSettings::OverrideProviderFromCurrentConfig
+    {
+        ResumeModelSettings::OverrideFromCurrentConfig
+    } else {
+        model_settings
+    };
     let permissions = permissions_selection_from_config(&config, thread_params_mode);
     let sandbox = permissions
         .is_none()
@@ -2426,8 +2435,11 @@ fn thread_resume_params_from_config(
         })
         .flatten();
     let mut config_overrides = config_request_overrides_from_config(&config, thread_params_mode);
-    if model_settings == ResumeModelSettings::RestoreFromThread
-        && let Some(overrides) = config_overrides.as_mut()
+    if matches!(
+        model_settings,
+        ResumeModelSettings::RestoreFromThread
+            | ResumeModelSettings::OverrideProviderFromCurrentConfig
+    ) && let Some(overrides) = config_overrides.as_mut()
     {
         overrides.remove("model_reasoning_effort");
         if overrides.is_empty() {
@@ -2439,6 +2451,9 @@ fn thread_resume_params_from_config(
             config.model.clone(),
             provider_selection::explicit_provider(&config),
         ),
+        ResumeModelSettings::OverrideProviderFromCurrentConfig => {
+            (None, provider_selection::explicit_provider(&config))
+        }
         ResumeModelSettings::RestoreFromThread | ResumeModelSettings::PreserveExistingThread => {
             (None, None)
         }

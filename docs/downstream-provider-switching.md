@@ -30,6 +30,13 @@ already loaded thread. Use the existing public close/resume flow and original
 thread ID; do not rewrite history, queues or goals. A blocked request leaves
 history readable so configuration can be repaired.
 
+When a remote TUI resumes with only an explicit provider choice, it sends that
+provider without replacing the saved model or reasoning effort with client
+defaults. Explicit model or effort choices and selected profiles keep their
+existing override semantics. Embedded TUI and cloud settings ownership are
+unchanged. This request projection does not grant provider-switching authority;
+the App Server still applies its startup flag and managed requirements.
+
 Without the flag, the upstream provider-mismatch errors remain unchanged. This
 exception deliberately changes the policy introduced by upstream
 [PR #57840](https://github.com/openai/codex/pull/57840), which stops execution when
@@ -40,7 +47,7 @@ saved and selected providers differ.
 Keep `main` as the upstream reference. Resolve the latest stable `rust-vVERSION`
 release, fetch and record its peeled commit, and start
 `workspace-candidate-rust-vVERSION-pN` on that exact commit. Replay only the
-provider compatibility commit with its tests and this documentation. Inspect
+provider compatibility commits with their tests and this documentation. Inspect
 upstream changes to `ConfigManager`, every common provider-guard caller, CLI
 parsing and runtime/child startup. Compare old and new patch ranges with
 `git range-diff`; account for every carried or retired change.
@@ -49,7 +56,13 @@ Run `just fmt-check`, inspect the complete release-base-to-head diff, and obtain
 independent review of the committed candidate before expensive Rust builds.
 After review, run the focused provider unit/protocol tests and CLI parsing tests
 using the repository's `just test -p codex-app-server` and
-`just test -p codex-cli` helpers with nextest filters. Verify actual inference
+`just test -p codex-cli` helpers with nextest filters. Also run the `codex-tui`
+library tests selected by
+`app_server_session::provider_selection_tests::resume_invocation_` and the existing
+`app::config_persistence::tests::resume_model_settings_preserves_only_explicit_model_overrides`
+control. List the selected tests first and require exactly six request-projection
+cases and that one selector control; an empty or different selection does not
+satisfy this check. Verify actual inference
 routing, same-ID switching, managed-policy refusal, malformed configuration,
 missing providers and attempts to enable the exception through request config.
 Then complete the host's native/state/child and package acceptance checks.

@@ -32,23 +32,32 @@ pub(super) fn resume_model_settings_for_overrides(
     config: &Config,
     harness_overrides: &ConfigOverrides,
 ) -> crate::app_server_session::ResumeModelSettings {
-    let has_layer_override = config.config_layer_stack.layers_high_to_low().any(|layer| {
-        matches!(
-            &layer.name,
-            ConfigLayerSource::SessionFlags
-                | ConfigLayerSource::User {
-                    profile: Some(_),
-                    ..
-                }
-        ) && ["model", "model_provider", "model_reasoning_effort"]
-            .iter()
-            .any(|key| layer.config.get(*key).is_some())
-    });
-    if harness_overrides.model.is_some()
-        || harness_overrides.model_provider.is_some()
-        || has_layer_override
-    {
+    let mut has_provider_override = harness_overrides.model_provider.is_some();
+    let mut has_model_settings_override = harness_overrides.model.is_some();
+    for layer in config.config_layer_stack.layers_high_to_low() {
+        match &layer.name {
+            ConfigLayerSource::SessionFlags => {
+                has_provider_override |= layer.config.get("model_provider").is_some();
+                has_model_settings_override |= ["model", "model_reasoning_effort"]
+                    .iter()
+                    .any(|key| layer.config.get(*key).is_some());
+            }
+            ConfigLayerSource::User {
+                profile: Some(_), ..
+            } => {
+                // A selected profile remains an intentional group of model settings.
+                has_model_settings_override |=
+                    ["model", "model_provider", "model_reasoning_effort"]
+                        .iter()
+                        .any(|key| layer.config.get(*key).is_some());
+            }
+            _ => {}
+        }
+    }
+    if has_model_settings_override {
         crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig
+    } else if has_provider_override {
+        crate::app_server_session::ResumeModelSettings::OverrideProviderFromCurrentConfig
     } else {
         crate::app_server_session::ResumeModelSettings::RestoreFromThread
     }
@@ -1469,6 +1478,16 @@ mod tests {
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
+    impl App {
+        /// Connect sibling-module request tests to the production startup selector.
+        pub(crate) fn resume_model_settings_for_config_for_test(
+            config: &Config,
+            harness_overrides: &ConfigOverrides,
+        ) -> crate::app_server_session::ResumeModelSettings {
+            resume_model_settings_for_overrides(config, harness_overrides)
+        }
+    }
+
     #[tokio::test]
     async fn update_reasoning_effort_updates_collaboration_mode() {
         let mut app = make_test_app().await;
@@ -1677,7 +1696,7 @@ mod tests {
             ),
             (
                 "model_provider",
-                crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig,
+                crate::app_server_session::ResumeModelSettings::OverrideProviderFromCurrentConfig,
             ),
             (
                 "model_reasoning_effort",
@@ -1706,7 +1725,12 @@ mod tests {
             app.config.config_layer_stack = ConfigLayerStack::default()
                 .with_user_config_profile(&profile_path, Some(&profile), config)
                 .expect("user config profile layer stack");
-            assert_eq!(app.resume_model_settings(), expected);
+            let profile_expected = if key == "model_provider" {
+                crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig
+            } else {
+                expected
+            };
+            assert_eq!(app.resume_model_settings(), profile_expected);
         }
 
         app.config.config_layer_stack = ConfigLayerStack::default()
@@ -1726,7 +1750,7 @@ mod tests {
         app.harness_overrides.model_provider = Some("custom-provider".to_string());
         assert_eq!(
             app.resume_model_settings(),
-            crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig
+            crate::app_server_session::ResumeModelSettings::OverrideProviderFromCurrentConfig
         );
     }
 

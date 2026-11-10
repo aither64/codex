@@ -177,7 +177,11 @@ impl AppServerSession {
             permission_overrides,
         );
         if self.thread_params_mode().settings_owner() == ThreadSettingsOwner::Client
-            && model_settings == ResumeModelSettings::OverrideFromCurrentConfig
+            && matches!(
+                model_settings,
+                ResumeModelSettings::OverrideFromCurrentConfig
+                    | ResumeModelSettings::OverrideProviderFromCurrentConfig
+            )
         {
             params.model_provider = self.explicit_model_provider(&config);
         }
